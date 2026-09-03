@@ -21,7 +21,7 @@
 set -uo pipefail
 umask 022   # 固定权限: 生成的脚本和配置不能因为宽松 umask 变成他人可写
 
-VERSION="0.5.6"
+VERSION="0.5.6+f.1"
 STATE_DIR="/var/lib/tcpfit"
 SYSCTL_FILE="/etc/sysctl.d/99-tcpfit.conf"
 QDISC_SCRIPT="/usr/local/sbin/tcpfit-qdisc.sh"
@@ -320,7 +320,7 @@ disp(){
 # 为什么不能直接复制"正在运行的脚本"：bash <(curl ...) 时 $0 是 /dev/fd/63,
 # 内容已被 bash 读走, 再 cat 只能读到 0 字节；curl | bash 时 $0 = bash, 根本不可读.
 # 实测验证过这两种情况. 所以只能按版本号回拉, 并校验拉到的确实是同一版.
-SELF_URL="https://raw.githubusercontent.com/Kylin010/tcpfit/v${VERSION}/tcpfit.sh"
+SELF_URL="https://raw.githubusercontent.com/finian/tcpfit/v${VERSION}/tcpfit.sh"
 self_install(){
   [ "$(id -u)" = 0 ] || return 0
   case "$0" in "$SELF_PATH") return 0 ;; esac      # 已经是装好的那份
@@ -721,21 +721,57 @@ cmd_rollback(){
     esac
   done
   info "回滚中…"
+  # initcwnd 必须【先】处理: $ROUTE_HOOK 和 $INITCWND_MARKER 就是 ownership 证据,
+  # 被下面那行 rm 删掉之后 clear_owned_initcwnd 只剩快照一条线索可查.
+  # 它自己会清掉这两个文件, 下面的 rm 只是兜底.
+  # 早期版本这里是 `ip route replace default via $gw dev $iface` —— 只保留网关和
+  # 网卡, 把机房下发的 metric/proto/src/mtu/onlink 一起抹掉了, 回滚后的路由跟
+  # 调优前并不是同一条. clear_owned_initcwnd 沿用 `ip route show` 的全部 token,
+  # 只剔除 initcwnd/initrwnd.
+  if clear_owned_initcwnd; then
+    [ "${INITCWND_CLEARED:-0}" = 1 ] && ok "已移除 tcpfit 写入的 initcwnd/initrwnd"
+  else
+    warn "默认路由改写失败, initcwnd 可能仍是 32；持久化 hook 已删, 重启后失效"
+  fi
+  # 证据不足时不动路由 —— 那多半是机房自己下发的, 撤掉反而是破坏.
+  if [ "${INITCWND_CLEARED:-0}" = 0 ]; then
+    local cur_route; cur_route=$(ip -4 route show default 2>/dev/null | head -1)
+    if has_str "$cur_route" ' initcwnd ' || has_str "$cur_route" ' initrwnd '; then
+      warn "默认路由上有 initcwnd/initrwnd, 但无证据是 tcpfit 写的, 已保留:"
+      warn "  $cur_route"
+    fi
+  fi
   rm -f "$SYSCTL_FILE" "$ROUTE_HOOK" "$INITCWND_MARKER" /etc/modules-load.d/tcpfit-bbr.conf
   systemctl disable --now tcpfit-qdisc.service >/dev/null 2>&1
   rm -f "$QDISC_UNIT" "$QDISC_SCRIPT"
   systemctl daemon-reload >/dev/null 2>&1
   local iface; iface=$(detect_iface)
   tc qdisc del dev "$iface" root 2>/dev/null
-  local gw; gw=$(detect_gw)
-  [ -n "$gw" ] && ip route replace default via "$gw" dev "$iface" 2>/dev/null
   # 逐项写回快照值
   if [ -f "$SNAPSHOT" ]; then
-    grep -E '^(net|vm|fs)\.' "$SNAPSHOT" | while IFS='=' read -r k v; do
+    # 【不能】用管道喂 while —— 那样循环跑在子 shell 里, 计数出来永远是 0.
+    local k v n_ok=0 n_fail=0
+    local -a failed=()
+    while IFS='=' read -r k v; do
       k=$(echo "$k" | xargs); v=$(echo "$v" | xargs)
-      [ -n "$k" ] && [ -n "$v" ] && sysctl -qw "$k=$v" 2>/dev/null
-    done
-    ok "已按快照还原 sysctl"
+      [ -n "$k" ] && [ -n "$v" ] || continue
+      if sysctl -qw "$k=$v" 2>/dev/null; then
+        n_ok=$((n_ok + 1))
+      else
+        n_fail=$((n_fail + 1)); failed+=("$k")
+      fi
+    done < <(grep -E '^(net|vm|fs)\.' "$SNAPSHOT")
+    if [ "$n_ok" = 0 ] && [ "$n_fail" = 0 ]; then
+      # 空快照. take_snapshot 的提示里有一条 `touch $SNAPSHOT`(= 放弃回滚能力),
+      # 走过那条路的机器这里一个参数都读不到 —— 不能再报"已还原",
+      # 否则用户以为参数回去了, 实际一项没动.
+      warn "快照 $SNAPSHOT 里没有任何参数, sysctl 未还原."
+      warn "调优文件已移除, 重启后内核默认值生效."
+    else
+      ok "已按快照还原 sysctl: $n_ok 项"
+      # 写不进去的键以前被 2>/dev/null 吞掉, 回滚看起来完全成功.
+      [ "$n_fail" -gt 0 ] && warn "$n_fail 项写回失败(内核可能不支持): ${failed[*]}"
+    fi
   else
     warn "找不到快照, 仅移除了调优文件；重启后内核默认值生效"
   fi
@@ -1941,7 +1977,7 @@ cmd_update(){
   info "检查更新…"
   local latest
   # 只看 release, 不看 main —— main 可能领先于任何已发布版本
-  latest=$(curl -fsSL --max-time 10 "https://api.github.com/repos/Kylin010/tcpfit/releases/latest" 2>/dev/null \
+  latest=$(curl -fsSL --max-time 10 "https://api.github.com/repos/finian/tcpfit/releases/latest" 2>/dev/null \
            | grep -m1 '"tag_name"' | sed 's/.*"tag_name"[[:space:]]*:[[:space:]]*"v\{0,1\}\([^"]*\)".*/\1/')
   [ -n "$latest" ] || die "查不到最新版本, 检查网络或稍后再试" 2
 
@@ -1954,14 +1990,14 @@ cmd_update(){
   echo
   _conf "当前版本" "v$VERSION"
   _conf "最新版本" "v$latest"
-  _conf "更新说明" "https://github.com/Kylin010/tcpfit/releases/tag/v$latest"
+  _conf "更新说明" "https://github.com/finian/tcpfit/releases/tag/v$latest"
   echo
   confirm "  现在更新？" y || { info "已取消"; return 0; }
 
   # 从 release 下, 用发布的 SHA256SUMS 校验. 只对比 tcpfit.sh 那一行 ——
   # SHA256SUMS 里还有 install.sh, 直接 sha256sum -c 会因为文件不在而失败.
   local dl; dl=$(mktemp -d)
-  local base="https://github.com/Kylin010/tcpfit/releases/download/v$latest"
+  local base="https://github.com/finian/tcpfit/releases/download/v$latest"
   if ! curl -fsSL --max-time 60 "$base/tcpfit.sh" -o "$dl/tcpfit.sh"; then
     rm -rf "$dl"; die "下载失败" 2
   fi

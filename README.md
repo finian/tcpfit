@@ -7,7 +7,7 @@
 ## 安装
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/Kylin010/tcpfit/main/tcpfit.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/finian/tcpfit/main/tcpfit.sh)
 ```
 
 跑完直接出菜单, 选 1 全自动. 脚本会装到 `/usr/local/bin/tcpfit`, 以后敲 `tcpfit` 即可.
@@ -118,7 +118,7 @@ tcpfit rollback --purge-swap   # 同时删掉 harden 建的 /swapfile
 tcpfit shape --off    # 只去掉整形
 ```
 
-首次改动前自动存快照到 `/var/lib/tcpfit/pre-tune.snapshot`, 记录全部 32 项参数的原始值.
+首次改动前自动存快照到 `/var/lib/tcpfit/pre-tune.snapshot`, 记录全部 33 项参数的原始值.
 
 swap 默认不动 —— 删掉正在用的 swap 可能让机器立刻 OOM, 要一并撤销得显式加 `--purge-swap`.
 
